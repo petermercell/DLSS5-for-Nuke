@@ -35,11 +35,20 @@ struct NGXPathListInfo {
 };
 enum NGXLoggingLevel { NGX_LOG_OFF = 0, NGX_LOG_ON = 1, NGX_LOG_VERBOSE = 2 };
 using NGXLogCallback = void(__cdecl*)(const char*, NGXLoggingLevel, int);
+
+// Layout must match NVIDIA's NVSDK_NGX_LoggingInfo exactly:
+//     { NVSDK_NGX_AppLogCallback LoggingCallback;
+//       NVSDK_NGX_Logging_Level  MinimumLoggingLevel;
+//       bool                     DisableOtherLoggingSinks; }
+// The callback comes FIRST and there is no UserData field. Declaring the level
+// first makes NGX read the enum value as a function pointer and call it -- with
+// NGX_LOG_VERBOSE that is a jump to address 0x2, which faults with
+// "page fault on execute access to 0x0000000000000002". It only looks harmless
+// while logging is off, because then the misread pointer is 0.
 struct NGXLoggingInfo {
+    NGXLogCallback  Callback;
     NGXLoggingLevel LoggingLevel;
-    NGXLogCallback Callback;
-    void* UserData;
-    bool DisableOtherLoggingSinks;
+    bool            DisableOtherLoggingSinks;
 };
 struct NGXFeatureCommonInfoInternal;
 struct NGXFeatureCommonInfo {
@@ -47,6 +56,26 @@ struct NGXFeatureCommonInfo {
     NGXFeatureCommonInfoInternal* InternalData;
     NGXLoggingInfo LoggingInfo;
 };
+
+// NGX result codes are the single most useful thing to see when an init fails
+// (0xBAD00002 = the runtime rejected the calling module), so render them the
+// way NVIDIA's own logs do rather than as a signed decimal.
+// NGX hands its own diagnostics to this callback when logging is enabled.
+// It is the only way to see why the runtime rejected something; the codes alone
+// say what happened, not which component it was unhappy about.
+static void __cdecl NGXLogSink(const char* message, NGXLoggingLevel level, int feature) {
+    if (!message) return;
+    const size_t n = std::strlen(message);
+    std::fprintf(stderr, "[NGX lvl=%d feat=%d] %s%s",
+                 (int)level, feature, message,
+                 (n && message[n - 1] == '\n') ? "" : "\n");
+}
+
+static std::string NGXResultToHex(NGXResult r) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%08X", (unsigned)r);
+    return std::string(buf);
+}
 
 static inline UINT AlignUp(UINT val, UINT alignment) {
     return (val + alignment - 1) & ~(alignment - 1);
@@ -172,29 +201,57 @@ static HMODULE LoadCoreNGX(const std::wstring& runtime) {
 // ---------------------------------------------------------------------------
 
 bool DLSSWorker::setupD3D12() {
+    // Every failure here records why. Under Wine/vkd3d-proton this function is
+    // the most likely thing to fail, and "init failed:" with an empty reason is
+    // no use to anyone.
     ComPtr<IDXGIFactory4> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        m_lastError = "CreateDXGIFactory1 failed (no DXGI implementation available)";
+        return false;
+    }
 
     ComPtr<IDXGIAdapter1> adapter;
+    unsigned adaptersSeen = 0, nvidiaSeen = 0;
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
         DXGI_ADAPTER_DESC1 desc{};
         adapter->GetDesc1(&desc);
+        ++adaptersSeen;
         if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || desc.VendorId != 0x10DE) continue;
+        ++nvidiaSeen;
         if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&m_device))))
             break;
     }
-    if (!m_device) return false;
+    if (!m_device) {
+        if (adaptersSeen == 0)
+            m_lastError = "No DXGI adapters enumerated at all (is vkd3d-proton installed in the prefix?)";
+        else if (nvidiaSeen == 0)
+            m_lastError = "Enumerated " + std::to_string(adaptersSeen) +
+                          " adapter(s) but none with NVIDIA vendor id 0x10DE";
+        else
+            m_lastError = "D3D12CreateDevice(FEATURE_LEVEL_12_0) failed on the NVIDIA adapter";
+        return false;
+    }
 
     D3D12_COMMAND_QUEUE_DESC qDesc{};
     qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(m_device->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&m_queue)))) return false;
+    if (FAILED(m_device->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&m_queue)))) {
+        m_lastError = "CreateCommandQueue failed"; return false;
+    }
 
-    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_cmdAlloc)))) return false;
-    if (FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_cmdAlloc.Get(), nullptr, IID_PPV_ARGS(&m_cmdList)))) return false;
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_cmdAlloc)))) {
+        m_lastError = "CreateCommandAllocator failed"; return false;
+    }
+    if (FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_cmdAlloc.Get(), nullptr, IID_PPV_ARGS(&m_cmdList)))) {
+        m_lastError = "CreateCommandList failed"; return false;
+    }
 
-    if (FAILED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) return false;
+    if (FAILED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
+        m_lastError = "CreateFence failed"; return false;
+    }
     m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!m_fenceEvent) return false;
+    if (!m_fenceEvent) {
+        m_lastError = "CreateEventW for the fence failed"; return false;
+    }
 
     return true;
 }
@@ -330,26 +387,38 @@ bool DLSSWorker::initNGX(const VideoHeader& hdr) {
         return false;
     }
 
-    std::wstring nrPath = runtimeDir + L"\\nvngx_dlssnr.dll";
-    if (!FileExists(nrPath)) {
-        m_lastError = "nvngx_dlssnr.dll not found in runtime directory";
-        return false;
-    }
-    m_nrMod = LoadLibraryW(nrPath.c_str());
-    if (!m_nrMod) {
-        m_lastError = "LoadLibrary(nvngx_dlssnr.dll) failed";
-        return false;
-    }
+    // DLSS5_SKIP_NR leaves both of these unloaded, so the process holds only
+    // what the standalone reproducer holds: the NGX core and nvngx_dlss.dll.
+    // The snippet runs code from DllMain, and our shim is named nvngx.dll --
+    // the same basename as a real NGX module -- so simply having them mapped is
+    // a difference worth being able to remove.
+    const bool skipNRInit = std::getenv("DLSS5_SKIP_NR") != nullptr;
 
-    std::wstring shimPath = runtimeDir + L"\\nvngx.dll";
-    if (!FileExists(shimPath)) {
-        m_lastError = "Caller shim nvngx.dll not found";
-        return false;
-    }
-    m_shimMod = LoadLibraryW(shimPath.c_str());
-    if (!m_shimMod) {
-        m_lastError = "LoadLibrary(nvngx.dll shim) failed";
-        return false;
+    if (!skipNRInit) {
+        std::wstring nrPath = runtimeDir + L"\\nvngx_dlssnr.dll";
+        if (!FileExists(nrPath)) {
+            m_lastError = "nvngx_dlssnr.dll not found in runtime directory";
+            return false;
+        }
+        m_nrMod = LoadLibraryW(nrPath.c_str());
+        if (!m_nrMod) {
+            m_lastError = "LoadLibrary(nvngx_dlssnr.dll) failed";
+            return false;
+        }
+
+        std::wstring shimPath = runtimeDir + L"\\nvngx.dll";
+        if (!FileExists(shimPath)) {
+            m_lastError = "Caller shim nvngx.dll not found";
+            return false;
+        }
+        m_shimMod = LoadLibraryW(shimPath.c_str());
+        if (!m_shimMod) {
+            m_lastError = "LoadLibrary(nvngx.dll shim) failed";
+            return false;
+        }
+    } else {
+        std::fprintf(stderr, "[DEBUG] DLSS5_SKIP_NR: nvngx_dlssnr.dll and the shim left unloaded\n");
+        std::fflush(stderr);
     }
 
     auto coreInitExt     = reinterpret_cast<InitExtFn>(GetProcAddress(m_coreMod, "NVSDK_NGX_D3D12_Init_Ext"));
@@ -362,37 +431,111 @@ bool DLSSWorker::initNGX(const VideoHeader& hdr) {
     auto shimInit        = reinterpret_cast<ShimInitFn>(GetProcAddress(m_shimMod, "DLSSNR_CallInit"));
     auto shimCreate      = reinterpret_cast<ShimCreateFn>(GetProcAddress(m_shimMod, "DLSSNR_CallCreate"));
 
-    if (!allocParams || !nrInit || !nrCreate || !shimInit || !shimCreate) {
-        m_lastError = "Failed to resolve required NGX / Snippet / Shim entry points";
+    if (!allocParams) {
+        m_lastError = "Failed to resolve NVSDK_NGX_D3D12_AllocateParameters in the NGX core";
+        return false;
+    }
+    if (!skipNRInit && (!nrInit || !nrCreate || !shimInit || !shimCreate)) {
+        m_lastError = "Failed to resolve required Snippet / Shim entry points";
         return false;
     }
 
+    // NGX generates a detailed explanation of its own failures and this code was
+    // throwing it away: logging off, and other sinks disabled too. Set
+    // DLSS5_NGX_VERBOSE=1 to route NVIDIA's own diagnostics to stderr, which the
+    // Linux launcher captures into dlss5-worker.log.
+    const bool ngxVerbose = std::getenv("DLSS5_NGX_VERBOSE") != nullptr;
+
     NGXFeatureCommonInfo fci{};
-    fci.LoggingInfo.LoggingLevel = NGX_LOG_OFF;
-    fci.LoggingInfo.DisableOtherLoggingSinks = true;
+    fci.LoggingInfo.LoggingLevel = ngxVerbose ? NGX_LOG_VERBOSE : NGX_LOG_OFF;
+    fci.LoggingInfo.Callback = ngxVerbose ? &NGXLogSink : nullptr;
+    fci.LoggingInfo.DisableOtherLoggingSinks = !ngxVerbose;
+
+    // Tell NGX where the snippets live. This was left zeroed, so the core had no
+    // search path of its own and relied entirely on the application data path.
+    const wchar_t* ngxPathList[1] = { runtimeDir.c_str() };
+    fci.PathListInfo.Path   = ngxPathList;
+    fci.PathListInfo.Length = 1;
 
     bool coreOk = false;
-    if (coreInitProject) {
+    NGXResult lastProjR = 0;
+    // Init_ProjectID cannot carry the FeatureCommonInfo safely (see the note
+    // below), so when it succeeds NGX runs with logging off and we never see its
+    // own diagnostics. DLSS5_NGX_FORCE_INITEXT=1 skips it and uses Init_Ext,
+    // which this typedef can pass the logging struct to.
+    const bool forceInitExt = std::getenv("DLSS5_NGX_FORCE_INITEXT") != nullptr;
+    if (coreInitProject && !forceInitExt) {
         for (int ver = 0x13; ver <= 0x20 && !coreOk; ++ver) {
+            // NOTE: keep nullptr here. This typedef declares the last two args
+            // as (int sdkVersion, const void* featureInfo), while NVIDIA's own
+            // header declares Init_ProjectID as (..., featureInfo, sdkVersion).
+            // caller_shim.cpp documents that the snippet and core disagree about
+            // exactly this ordering, so passing a real pointer in the last slot
+            // makes NGX read a version out of a pointer and a struct out of an
+            // int -- which crashes inside _nvngx.dll rather than failing.
             NGXResult r = coreInitProject(PROJECT_ID, 0, "1.0.0", runtimeDir.c_str(), m_device.Get(), ver, nullptr);
+            lastProjR = r;
             coreOk = (r == 1);
+            if (ngxVerbose) {
+                std::fprintf(stderr, "[DLSS5 worker] Init_ProjectID(ver=0x%02X) -> %s\n",
+                             ver, NGXResultToHex(r).c_str());
+            }
+            // A platform error is not version-dependent: the core has no usable
+            // driver behind it. Retrying every version leaves it in a state
+            // where a later call jumps through a stale pointer and faults
+            // inside _nvngx.dll, which buries the real cause under a crash.
+            if (r == 0xBAD00002) break;
         }
     }
+    NGXResult lastCoreR = 0;
     if (!coreOk && coreInitExt) {
         for (int ver = 0x13; ver <= 0x20 && !coreOk; ++ver) {
-            NGXResult r = coreInitExt(APP_ID, runtimeDir.c_str(), m_device.Get(), ver, &fci);
+            // Passing our own FeatureCommonInfo has never actually produced a
+            // log line, and a wrong layout in that struct previously made NGX
+            // call a logging-level constant as a function pointer. With
+            // nullptr, NGX applies its own defaults and writes <runtime>/
+            // nvngx.log itself -- which is where "could not find <X> parameter"
+            // came from. Set DLSS5_NGX_USE_FCI=1 to pass the struct instead.
+            const void* featureInfo =
+                std::getenv("DLSS5_NGX_USE_FCI") ? (const void*)&fci : nullptr;
+            NGXResult r = coreInitExt(APP_ID, runtimeDir.c_str(), m_device.Get(), ver, featureInfo);
+            lastCoreR = r;
             coreOk = (r == 1);
+            if (ngxVerbose) {
+                std::fprintf(stderr, "[DLSS5 worker] Init_Ext(ver=0x%02X) -> %s\n",
+                             ver, NGXResultToHex(r).c_str());
+            }
+            if (r == 0xBAD00002) break;   // see the note above
         }
     }
     if (!coreOk) {
-        m_lastError = "NGX Core initialization failed";
+        // Report both paths: they can fail for different reasons, and only
+        // seeing the last one hides that.
+        m_lastError = "NGX Core initialization failed (Init_ProjectID=" + NGXResultToHex(lastProjR) +
+                      ", Init_Ext=" + NGXResultToHex(lastCoreR) + ")";
+        if (lastCoreR == 0xBAD0000C || lastProjR == 0xBAD0000C) {
+            m_lastError += " [OutOfDate: the NGX core considers a component too old]";
+        }
+        m_setup.setup_result = (uint32_t)(lastCoreR ? lastCoreR : lastProjR);
+        std::fflush(stderr);
         return false;
     }
 
-    NGXResult sr = shimInit(reinterpret_cast<void*>(nrInit), APP_ID, runtimeDir.c_str(), m_device.Get(), 0x15, &fci);
-    if (sr != 1) {
-        m_lastError = "DLSSNR Snippet initialization via caller shim failed";
-        return false;
+    // DLSS5_SKIP_NR previously skipped only the NR *evaluate*, leaving the
+    // snippet initialised and feature 18 created. That is not an isolation of
+    // DLSS-SR: the snippet init runs through the caller shim and hands NGX the
+    // FeatureCommonInfo struct, so anything it disturbs is still in play when
+    // feature 1 evaluates. Skip the whole NR side so "SR only" means it.
+    if (!skipNRInit) {
+        NGXResult sr = shimInit(reinterpret_cast<void*>(nrInit), APP_ID, runtimeDir.c_str(), m_device.Get(), 0x15, &fci);
+        if (sr != 1) {
+            m_lastError = "DLSSNR Snippet initialization via caller shim failed (code=" + NGXResultToHex(sr) + ")";
+            m_setup.setup_result = (uint32_t)sr;
+            return false;
+        }
+    } else {
+        std::fprintf(stderr, "[DEBUG] DLSS5_SKIP_NR: snippet init and feature 18 creation skipped\n");
+        std::fflush(stderr);
     }
 
     if (allocParams(&m_params) != 1 || !m_params) {
@@ -402,10 +545,13 @@ bool DLSSWorker::initNGX(const VideoHeader& hdr) {
 
     setCommonParams(true);
 
-    NGXResult cr = shimCreate(reinterpret_cast<void*>(nrCreate), m_cmdList.Get(), NR_FEATURE_ID, m_params, &m_feature);
-    if (cr != 1 || !m_feature) {
-        m_lastError = "CreateFeature(18: DLSS-NR) failed";
-        return false;
+    if (!skipNRInit) {
+        NGXResult cr = shimCreate(reinterpret_cast<void*>(nrCreate), m_cmdList.Get(), NR_FEATURE_ID, m_params, &m_feature);
+        if (cr != 1 || !m_feature) {
+            m_lastError = "CreateFeature(18: DLSS-NR) failed (code=" + NGXResultToHex(cr) + ")";
+            m_setup.setup_result = (uint32_t)cr;
+            return false;
+        }
     }
 
     // If upscaling requested (>1.0x), create Feature 1 (DLSS-SR) for Pass 2
@@ -426,10 +572,25 @@ bool DLSSWorker::initNGX(const VideoHeader& hdr) {
         m_srParams->Set("OutWidth", m_outW);
         m_srParams->Set("OutHeight", m_outH);
         m_srParams->Set("PerfQualityValue", (int)m_hdr.perf_quality);
-        m_srParams->Set("DLSS.Feature.Create.Flags", (unsigned int)(1 | 8)); // IsHDR (1) | DepthInverted (8)
-        m_srParams->Set("DLSS.Hint.Render.Preset", (int)m_hdr.dlss_model_preset);
+        // IsHDR (1<<0) | DepthInverted (1<<3) | AutoExposure (1<<6).
+        //
+        // AutoExposure is not optional here. Without it DLSS expects the app to
+        // supply an "ExposureTexture" at evaluate time, and refuses with
+        // 0xBAD00005 (FAIL_InvalidParameter) when it is absent -- which is
+        // indistinguishable from any other bad parameter. Nuke feeds this node
+        // scene-linear frames with no exposure buffer of their own, so letting
+        // DLSS derive exposure from the colour input is the right behaviour as
+        // well as the one that works.
+        m_srParams->Set("DLSS.Feature.Create.Flags",
+                        (unsigned int)((1u << 0) | (1u << 3) | (1u << 6)));
+        if (!std::getenv("DLSS5_SR_MINIMAL"))
+            m_srParams->Set("DLSS.Hint.Render.Preset", (int)m_hdr.dlss_model_preset);
 
-        NGXResult srCr = shimCreate(reinterpret_cast<void*>(coreCreate), m_cmdList.Get(), 1, m_srParams, &m_srFeature);
+        // As with Evaluate: feature 1 has no caller-module check, so when the
+        // shim is not loaded at all (DLSS5_SKIP_NR) call the core directly.
+        NGXResult srCr = shimCreate
+            ? shimCreate(reinterpret_cast<void*>(coreCreate), m_cmdList.Get(), 1, m_srParams, &m_srFeature)
+            : coreCreate(m_cmdList.Get(), 1, m_srParams, &m_srFeature);
         if (srCr != 1 || !m_srFeature) {
             m_lastError = "CreateFeature(1: DLSS-SR) failed (code=" + std::to_string(srCr) + ")";
             return false;
@@ -444,9 +605,18 @@ bool DLSSWorker::initNGX(const VideoHeader& hdr) {
 bool DLSSWorker::init(const VideoHeader& hdr) {
     m_legacyRgba8 = hdr.magic == 0x34563544u;
     m_hdr = hdr;
-    if (!setupD3D12()) return false;
-    if (!allocateResources(hdr.input_width, hdr.input_height, hdr.output_width, hdr.output_height)) return false;
-    if (!initNGX(hdr)) return false;
+    if (!setupD3D12()) {
+        if (m_lastError.empty()) m_lastError = "D3D12 setup failed";
+        return false;
+    }
+    if (!allocateResources(hdr.input_width, hdr.input_height, hdr.output_width, hdr.output_height)) {
+        if (m_lastError.empty()) m_lastError = "GPU resource allocation failed";
+        return false;
+    }
+    if (!initNGX(hdr)) {
+        if (m_lastError.empty()) m_lastError = "NGX initialization failed";
+        return false;
+    }
 
     m_setup.magic                = 0x34505553u; // 'SUP4'
     m_setup.setup_ok             = 1;
@@ -671,6 +841,20 @@ bool DLSSWorker::processFrame(
     m_cmdList->ResourceBarrier((UINT)postBarriers.size(), postBarriers.data());
 
     // 4. Evaluate Feature 18 (DLSS-NR Pass 1)
+    // Setting a guide parameter to a null resource is not the same as leaving it
+    // unset. Windows tolerates the null; a stricter D3D12 implementation can
+    // reject it as an invalid parameter, which is what 0xBAD00005 means.
+    // DLSS5_NR_OMIT_NULL_GUIDES=1 omits them instead.
+    const bool omitNullGuides = std::getenv("DLSS5_NR_OMIT_NULL_GUIDES") != nullptr;
+
+    // Isolation test. DLSS5_SKIP_NR=1 bypasses feature 18 entirely and drives
+    // feature 1 (plain DLSS Super Resolution) straight from the colour texture.
+    // If SR evaluates and NR does not, the D3D12/NGX stack underneath is sound
+    // and the refusal is specific to the neural-rendering snippet. If SR fails
+    // the same way, the problem is the NGX-on-vkd3d-proton path in general.
+    // Requires an upscaling ratio, e.g. worker_probe --scale 2.0
+    const bool skipNR = std::getenv("DLSS5_SKIP_NR") != nullptr;
+
     m_params->Set("DLSSNR.Reset", reset ? 1 : 0);
     if (depth_in) {
         m_params->Set("DLSSNR.Depth", m_depthTex.Get());
@@ -678,7 +862,7 @@ bool DLSSWorker::processFrame(
         m_params->Set("DLSSNR.DepthSubrectBaseY", 0);
         m_params->Set("DLSSNR.DepthSubrectWidth", m_inW);
         m_params->Set("DLSSNR.DepthSubrectHeight", m_inH);
-    } else {
+    } else if (!omitNullGuides) {
         m_params->Set("DLSSNR.Depth", (ID3D12Resource*)nullptr);
     }
     if (control_mask_in) {
@@ -687,27 +871,36 @@ bool DLSSWorker::processFrame(
         m_params->Set("DLSSNR.ControlMaskSubrectBaseY", 0);
         m_params->Set("DLSSNR.ControlMaskSubrectWidth", m_inW);
         m_params->Set("DLSSNR.ControlMaskSubrectHeight", m_inH);
-    } else {
+    } else if (!omitNullGuides) {
         m_params->Set("DLSSNR.ControlMask", (ID3D12Resource*)nullptr);
     }
 
-    auto nrEval = reinterpret_cast<EvaluateFeatureFn>(GetProcAddress(m_nrMod, "NVSDK_NGX_D3D12_EvaluateFeature"));
-    auto shimEval = reinterpret_cast<ShimEvaluateFn>(GetProcAddress(m_shimMod, "DLSSNR_CallEvaluate"));
-    if (!nrEval || !shimEval) return false;
+    auto nrEval = reinterpret_cast<EvaluateFeatureFn>(
+        m_nrMod ? GetProcAddress(m_nrMod, "NVSDK_NGX_D3D12_EvaluateFeature") : nullptr);
+    auto shimEval = reinterpret_cast<ShimEvaluateFn>(
+        m_shimMod ? GetProcAddress(m_shimMod, "DLSSNR_CallEvaluate") : nullptr);
+    if (!skipNR && (!nrEval || !shimEval)) return false;
 
-    NGXResult er = shimEval(reinterpret_cast<void*>(nrEval), m_cmdList.Get(), m_feature, m_params, nullptr);
-    if (er != 1) {
-        fprintf(stderr, "[DEBUG] Pass 1 (Feature 18 NR) Evaluate failed: 0x%08X\n", er);
+    if (skipNR) {
+        fprintf(stderr, "[DEBUG] DLSS5_SKIP_NR set: bypassing feature 18, SR only\n");
         fflush(stderr);
-        return false;
+    } else {
+        NGXResult er = shimEval(reinterpret_cast<void*>(nrEval), m_cmdList.Get(), m_feature, m_params, nullptr);
+        if (er != 1) {
+            fprintf(stderr, "[DEBUG] Pass 1 (Feature 18 NR) Evaluate failed: 0x%08X\n", er);
+            fflush(stderr);
+            return false;
+        }
     }
 
     // 4.5. If upscaling, Evaluate Feature 1 (DLSS-SR Pass 2)
     if (m_needUpscale && m_srFeature && m_srParams) {
-        auto bInter1 = Barrier(m_intermediateTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        m_cmdList->ResourceBarrier(1, &bInter1);
+        if (!skipNR) {
+            auto bInter1 = Barrier(m_intermediateTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            m_cmdList->ResourceBarrier(1, &bInter1);
+        }
 
-        m_srParams->Set("Color", m_intermediateTex.Get());
+        m_srParams->Set("Color", skipNR ? m_colorTex.Get() : m_intermediateTex.Get());
         m_srParams->Set("Output", m_outputTex.Get());
         m_srParams->Set("MotionVectors", m_mvTex.Get());
         m_srParams->Set("Depth", m_depthTex.Get());
@@ -718,8 +911,13 @@ bool DLSSWorker::processFrame(
         m_srParams->Set("MV.Scale.Y", 1.0f);
         m_srParams->Set("DLSS.Render.Subrect.Dimensions.Width", (unsigned int)m_inW);
         m_srParams->Set("DLSS.Render.Subrect.Dimensions.Height", (unsigned int)m_inH);
-        m_srParams->Set("DLSS.Pre.Exposure", 1.0f);
-        m_srParams->Set("DLSS.Exposure.Scale", 1.0f);
+        // DLSS5_SR_MINIMAL=1 drops everything the standalone reproducer does
+        // not set, so the worker's feature-1 call can be reduced to a known-good
+        // parameter set and the extras added back one at a time.
+        if (!std::getenv("DLSS5_SR_MINIMAL")) {
+            m_srParams->Set("DLSS.Pre.Exposure", 1.0f);
+            m_srParams->Set("DLSS.Exposure.Scale", 1.0f);
+        }
 
         auto coreEval = reinterpret_cast<EvaluateFeatureFn>(GetProcAddress(m_coreMod, "NVSDK_NGX_D3D12_EvaluateFeature"));
         if (!coreEval) {
@@ -728,15 +926,96 @@ bool DLSSWorker::processFrame(
             return false;
         }
 
-        NGXResult srEr = shimEval(reinterpret_cast<void*>(coreEval), m_cmdList.Get(), m_srFeature, m_srParams, nullptr);
+        // DLSS5_DUMP_SR=1 reads every parameter back out of the object right
+        // before the call. Reading back is what exposed the vtable ordering
+        // bug; if a value does not survive Set->Get it never reached NGX.
+        if (std::getenv("DLSS5_DUMP_SR")) {
+            auto res = [&](const char* n) {
+                ID3D12Resource* p = nullptr;
+                NGXResult g = m_srParams->Get(n, &p);
+                std::fprintf(stderr, "[SR] %-34s get=0x%08X %p\n", n, g, (void*)p);
+            };
+            auto ui = [&](const char* n) {
+                unsigned int v = 0xDEADBEEF;
+                NGXResult g = m_srParams->Get(n, &v);
+                std::fprintf(stderr, "[SR] %-34s get=0x%08X %u\n", n, g, v);
+            };
+            auto fl = [&](const char* n) {
+                float v = -12345.0f;
+                NGXResult g = m_srParams->Get(n, &v);
+                std::fprintf(stderr, "[SR] %-34s get=0x%08X %f\n", n, g, v);
+            };
+            // Which vtable slot did the compiler actually assign each overload?
+            // MinGW GCC uses the Itanium C++ ABI, where a pointer-to-virtual-
+            // member holds (vtable byte offset + 1) in its first word. That
+            // turns "which slot does this overload call" into a printable
+            // number instead of a guess.
+            {
+                auto slotOf = [](auto pmf) -> long long {
+                    struct MemPtr { uintptr_t ptr; ptrdiff_t adj; } m{};
+                    static_assert(sizeof(pmf) >= sizeof(MemPtr), "member ptr layout");
+                    std::memcpy(&m, &pmf, sizeof m);
+                    return (m.ptr & 1) ? (long long)((m.ptr - 1) / sizeof(void*)) : -1;
+                };
+                using P = NGXParameter;
+                std::fprintf(stderr, "[SR] --- overload -> vtable slot (expect 1/3/4/6 and 9/11/12/14) ---\n");
+                std::fprintf(stderr, "[SR]   Set(ID3D12Resource*) = %lld\n",
+                    slotOf(static_cast<void (P::*)(const char*, ID3D12Resource*)>(&P::Set)));
+                std::fprintf(stderr, "[SR]   Set(int)             = %lld\n",
+                    slotOf(static_cast<void (P::*)(const char*, int)>(&P::Set)));
+                std::fprintf(stderr, "[SR]   Set(unsigned int)    = %lld\n",
+                    slotOf(static_cast<void (P::*)(const char*, unsigned int)>(&P::Set)));
+                std::fprintf(stderr, "[SR]   Set(float)           = %lld\n",
+                    slotOf(static_cast<void (P::*)(const char*, float)>(&P::Set)));
+                std::fprintf(stderr, "[SR]   Get(ID3D12Resource**)= %lld\n",
+                    slotOf(static_cast<NGXResult (P::*)(const char*, ID3D12Resource**) const>(&P::Get)));
+                std::fprintf(stderr, "[SR]   Get(int*)            = %lld\n",
+                    slotOf(static_cast<NGXResult (P::*)(const char*, int*) const>(&P::Get)));
+                std::fprintf(stderr, "[SR]   Get(unsigned int*)   = %lld\n",
+                    slotOf(static_cast<NGXResult (P::*)(const char*, unsigned int*) const>(&P::Get)));
+                std::fprintf(stderr, "[SR]   Get(float*)          = %lld\n",
+                    slotOf(static_cast<NGXResult (P::*)(const char*, float*) const>(&P::Get)));
+            }
+            std::fprintf(stderr, "[SR] --- parameters as NGX will see them ---\n");
+            std::fprintf(stderr, "[SR] resources: color=%p out=%p mv=%p depth=%p\n",
+                         (void*)(skipNR ? m_colorTex.Get() : m_intermediateTex.Get()),
+                         (void*)m_outputTex.Get(), (void*)m_mvTex.Get(), (void*)m_depthTex.Get());
+            res("Color"); res("Output"); res("MotionVectors"); res("Depth");
+            ui("Width"); ui("Height"); ui("OutWidth"); ui("OutHeight");
+            ui("DLSS.Feature.Create.Flags");
+            ui("DLSS.Render.Subrect.Dimensions.Width");
+            ui("DLSS.Render.Subrect.Dimensions.Height");
+            fl("Jitter.Offset.X"); fl("MV.Scale.X");
+            {
+                int v = -1;
+                std::fprintf(stderr, "[SR] %-34s get=0x%08X %d\n", "PerfQualityValue",
+                             m_srParams->Get("PerfQualityValue", &v), v);
+                v = -1;
+                std::fprintf(stderr, "[SR] %-34s get=0x%08X %d\n", "Reset",
+                             m_srParams->Get("Reset", &v), v);
+            }
+            std::fprintf(stderr, "[SR] feature=%p cmdlist=%p\n",
+                         (void*)m_srFeature, (void*)m_cmdList.Get());
+            std::fprintf(stderr, "[SR] --- end ---\n");
+            std::fflush(stderr);
+        }
+
+        // With NR skipped entirely there is no shim in the process, and feature
+        // 1 has no caller-module check to satisfy, so call the core directly --
+        // exactly as the standalone reproducer does.
+        NGXResult srEr = shimEval
+            ? shimEval(reinterpret_cast<void*>(coreEval), m_cmdList.Get(), m_srFeature, m_srParams, nullptr)
+            : coreEval(m_cmdList.Get(), m_srFeature, m_srParams, nullptr);
         if (srEr != 1) {
             fprintf(stderr, "[DEBUG] Pass 2 (Feature 1 SR) Evaluate failed: 0x%08X\n", srEr);
             fflush(stderr);
             return false;
         }
 
-        auto bInter2 = Barrier(m_intermediateTex.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        m_cmdList->ResourceBarrier(1, &bInter2);
+        if (!skipNR) {
+            auto bInter2 = Barrier(m_intermediateTex.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            m_cmdList->ResourceBarrier(1, &bInter2);
+        }
     }
 
     // 5. Readback result
@@ -806,8 +1085,12 @@ bool DLSSWorker::processFrame(
 void DLSSWorker::shutdown() {
     if (m_srFeature) {
         auto coreRelease = reinterpret_cast<ReleaseFeatureFn>(GetProcAddress(m_coreMod, "NVSDK_NGX_D3D12_ReleaseFeature"));
-        auto shimRelease = reinterpret_cast<ShimReleaseFn>(GetProcAddress(m_shimMod, "DLSSNR_CallRelease"));
-        if (coreRelease && shimRelease) shimRelease(reinterpret_cast<void*>(coreRelease), m_srFeature);
+        auto shimRelease = reinterpret_cast<ShimReleaseFn>(
+            m_shimMod ? GetProcAddress(m_shimMod, "DLSSNR_CallRelease") : nullptr);
+        if (coreRelease) {
+            if (shimRelease) shimRelease(reinterpret_cast<void*>(coreRelease), m_srFeature);
+            else             coreRelease(m_srFeature);
+        }
         m_srFeature = nullptr;
     }
     if (m_srParams) {
@@ -816,8 +1099,10 @@ void DLSSWorker::shutdown() {
         m_srParams = nullptr;
     }
     if (m_feature) {
-        auto nrRelease = reinterpret_cast<ReleaseFeatureFn>(GetProcAddress(m_nrMod, "NVSDK_NGX_D3D12_ReleaseFeature"));
-        auto shimRelease = reinterpret_cast<ShimReleaseFn>(GetProcAddress(m_shimMod, "DLSSNR_CallRelease"));
+        auto nrRelease = reinterpret_cast<ReleaseFeatureFn>(
+            m_nrMod ? GetProcAddress(m_nrMod, "NVSDK_NGX_D3D12_ReleaseFeature") : nullptr);
+        auto shimRelease = reinterpret_cast<ShimReleaseFn>(
+            m_shimMod ? GetProcAddress(m_shimMod, "DLSSNR_CallRelease") : nullptr);
         if (nrRelease && shimRelease) shimRelease(reinterpret_cast<void*>(nrRelease), m_feature);
         m_feature = nullptr;
     }

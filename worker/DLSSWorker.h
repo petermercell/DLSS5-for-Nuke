@@ -14,6 +14,27 @@ using Microsoft::WRL::ComPtr;
 using NGXResult = int;
 struct NGXHandle { unsigned int Id; };
 
+// OVERLOAD ORDER IS COMPILER-DEPENDENT AND MUST NOT BE "TIDIED UP".
+// This is the interface DLSSWorker.cpp actually uses; NGX.h carries the same
+// declaration under the name NVSDK_NGX_Parameter. Keep the two in step.
+//
+// MSVC gathers every overload of one name at the position of the FIRST
+// declaration and emits them into the vtable in REVERSE declaration order.
+// GCC/Clang (and therefore mingw-w64) emit them in declaration order. nvngx.dll
+// is built with MSVC, so a mingw-built caller that transcribes NVIDIA's header
+// literally gets a mirror-image vtable within each overload group:
+//
+//     Set(name, ID3D12Resource*)  ->  lands on  Set(name, float)
+//
+// which reads its argument from XMM2, never sees the pointer, and stores
+// nothing. NGX then fails EvaluateFeature with 0xBAD00005 and logs
+// "could not find Color parameter". Integer parameters keep working by luck,
+// because int and unsigned int store the same 32 bits -- which is exactly how
+// this hid: dimensions arrived correctly while every resource was dropped.
+//
+// Slot numbers below are the observed vtable indices in _nvngx.dll from driver
+// 610.57.04, verified by reading each value back after setting it.
+#if defined(_MSC_VER)
 struct NGXParameter {
     virtual void Set(const char*, unsigned long long) = 0;
     virtual void Set(const char*, float) = 0;
@@ -33,6 +54,27 @@ struct NGXParameter {
     virtual NGXResult Get(const char*, void**) const = 0;
     virtual void Reset() = 0;
 };
+#else
+struct NGXParameter {
+    virtual void Set(const char*, void*) = 0;                          // slot  0
+    virtual void Set(const char*, ID3D12Resource*) = 0;                // slot  1
+    virtual void Set(const char*, ID3D11Resource*) = 0;                // slot  2
+    virtual void Set(const char*, int) = 0;                            // slot  3
+    virtual void Set(const char*, unsigned int) = 0;                   // slot  4
+    virtual void Set(const char*, double) = 0;                         // slot  5
+    virtual void Set(const char*, float) = 0;                          // slot  6
+    virtual void Set(const char*, unsigned long long) = 0;             // slot  7
+    virtual NGXResult Get(const char*, void**) const = 0;              // slot  8
+    virtual NGXResult Get(const char*, ID3D12Resource**) const = 0;    // slot  9
+    virtual NGXResult Get(const char*, ID3D11Resource**) const = 0;    // slot 10
+    virtual NGXResult Get(const char*, int*) const = 0;                // slot 11
+    virtual NGXResult Get(const char*, unsigned int*) const = 0;       // slot 12
+    virtual NGXResult Get(const char*, double*) const = 0;             // slot 13
+    virtual NGXResult Get(const char*, float*) const = 0;              // slot 14
+    virtual NGXResult Get(const char*, unsigned long long*) const = 0; // slot 15
+    virtual void Reset() = 0;                                          // slot 16
+};
+#endif
 
 class DLSSWorker {
 public:

@@ -63,59 +63,51 @@ static const char* get_default_worker_path() {
         return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
     };
 
-    // 2. Relative to this DLL module directory: <dll_dir>/runtime/DLSS_Nuke_Worker.exe or nvngx.dll
-    HMODULE hMod = NULL;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)&get_default_worker_path, &hMod)) {
-        char modPath[MAX_PATH] = {0};
-        if (GetModuleFileNameA(hMod, modPath, MAX_PATH)) {
-            std::string dir = modPath;
-            std::replace(dir.begin(), dir.end(), '\\', '/');
-            size_t slash = dir.rfind('/');
-            if (slash != std::string::npos) {
-                std::string base = dir.substr(0, slash);
-                const char* subpaths[] = {
-                    "/runtime/DLSS_Nuke_Worker.exe",
-                    "/../runtime/DLSS_Nuke_Worker.exe",
-                    "/../../runtime/DLSS_Nuke_Worker.exe",
-                    "/DLSS_Nuke_Worker.exe",
-                    "/runtime/nvngx.dll",
-                    "/../runtime/nvngx.dll",
-                    "/../../runtime/nvngx.dll",
-                    "/nvngx.dll"
-                };
-                for (const char* sub : subpaths) {
-                    std::string cand = base + sub;
-                    if (check_path(cand)) {
-                        char fullBuf[MAX_PATH] = {0};
-                        if (GetFullPathNameA(cand.c_str(), MAX_PATH, fullBuf, nullptr)) {
-                            cand = fullBuf;
-                            std::replace(cand.begin(), cand.end(), '\\', '/');
-                        }
-                        g_resolved_worker_path = cand;
-                        return g_resolved_worker_path.c_str();
-                    }
+    // Candidate worker file names, in priority order.
+    // On Linux a wrapper script (dlss5-worker.sh) is preferred when present: it
+    // sets up the Wine prefix before exec'ing the PE worker. The bridge also
+    // launches a bare ".exe" through Wine on its own, so both work.
+    static const char* const worker_names[] = {
+#ifndef _WIN32
+        "dlss5-worker.sh",
+#endif
+        "DLSS_Nuke_Worker.exe",
+        "nvngx.dll"
+    };
+    static const char* const worker_dirs[] = {
+        "/runtime/", "/../runtime/", "/../../runtime/", "/"
+    };
+
+    // 2. Relative to this plug-in's own module directory
+    const std::string base = dlss5::moduleDir((const void*)&get_default_worker_path);
+    if (!base.empty()) {
+        for (const char* sub : worker_dirs) {
+            for (const char* name : worker_names) {
+                std::string cand = base + sub + name;
+                if (check_path(cand)) {
+                    g_resolved_worker_path = dlss5::absolutePath(cand);
+                    return g_resolved_worker_path.c_str();
                 }
             }
         }
     }
-    // 3. ~/.nuke/DLSS5Live/runtime/
-    const char* user_profile = std::getenv("USERPROFILE");
-    if (user_profile) {
-        std::string uBase = std::string(user_profile) + "/.nuke/DLSS5Live/runtime";
-        std::replace(uBase.begin(), uBase.end(), '\\', '/');
-        std::string p1Exe = uBase + "/DLSS_Nuke_Worker.exe";
-        if (check_path(p1Exe)) { g_resolved_worker_path = p1Exe; return g_resolved_worker_path.c_str(); }
-        std::string p1Dll = uBase + "/nvngx.dll";
-        if (check_path(p1Dll)) { g_resolved_worker_path = p1Dll; return g_resolved_worker_path.c_str(); }
 
-        // 4. ~/.nuke/runtime/ (legacy fallback)
-        std::string legBase = std::string(user_profile) + "/.nuke/runtime";
-        std::replace(legBase.begin(), legBase.end(), '\\', '/');
-        std::string p2Exe = legBase + "/DLSS_Nuke_Worker.exe";
-        if (check_path(p2Exe)) { g_resolved_worker_path = p2Exe; return g_resolved_worker_path.c_str(); }
-        std::string p2Dll = legBase + "/nvngx.dll";
-        if (check_path(p2Dll)) { g_resolved_worker_path = p2Dll; return g_resolved_worker_path.c_str(); }
+    // 3. ~/.nuke/DLSS5Live/runtime/ , then 4. ~/.nuke/runtime/ (legacy fallback)
+    const std::string home = dlss5::homeDir();
+    if (!home.empty()) {
+        const std::string user_dirs[] = {
+            home + "/.nuke/DLSS5Live/runtime/",
+            home + "/.nuke/runtime/"
+        };
+        for (const std::string& dir : user_dirs) {
+            for (const char* name : worker_names) {
+                std::string cand = dir + name;
+                if (check_path(cand)) {
+                    g_resolved_worker_path = cand;
+                    return g_resolved_worker_path.c_str();
+                }
+            }
+        }
     }
     // 5. No valid worker runtime resolved
     return "";

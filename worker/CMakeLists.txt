@@ -3,9 +3,14 @@ project(DLSS_Nuke_Worker CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 
-# Windows only
+# The worker is D3D12 + NGX, so the *target* is always Windows. It can be built
+# either natively with MSVC or cross-compiled from Linux with mingw-w64 (see
+# cmake/toolchain-mingw64.cmake) and then run under Wine/Proton.
 if(NOT WIN32)
-    message(FATAL_ERROR "Worker only supports Windows (D3D12 + DLSS)")
+    message(FATAL_ERROR
+        "The worker targets Windows (D3D12 + NGX).\n"
+        "To cross-compile it from Linux, configure with:\n"
+        "  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw64.cmake")
 endif()
 
 # 1. Main Worker Executable
@@ -28,9 +33,9 @@ target_compile_definitions(DLSS_Nuke_Worker PRIVATE
 )
 
 target_link_libraries(DLSS_Nuke_Worker PRIVATE
-    d3d12.lib
-    dxgi.lib
-    dxguid.lib
+    d3d12
+    dxgi
+    dxguid
 )
 
 # 2. Native Caller Shim DLL (named nvngx.dll to satisfy NGX snippet return address check)
@@ -48,16 +53,27 @@ target_compile_definitions(nvngx PRIVATE
     NOMINMAX
 )
 
-target_link_libraries(nvngx PRIVATE
-    d3d12.lib
-)
+target_link_libraries(nvngx PRIVATE d3d12)
 
-# Release optimizations
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    target_compile_options(DLSS_Nuke_Worker PRIVATE /O2 /GL)
-    target_link_options(DLSS_Nuke_Worker PRIVATE /LTCG)
-    target_compile_options(nvngx PRIVATE /O2)
+if(MSVC)
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        target_compile_options(DLSS_Nuke_Worker PRIVATE /O2 /GL)
+        target_link_options(DLSS_Nuke_Worker PRIVATE /LTCG)
+        target_compile_options(nvngx PRIVATE /O2)
+    endif()
+else()
+    # mingw-w64: statically link the GCC runtime so the produced PE has no
+    # libgcc/libstdc++ DLL dependencies inside the Wine prefix.
+    target_compile_options(DLSS_Nuke_Worker PRIVATE -O2)
+    target_link_options(DLSS_Nuke_Worker PRIVATE -static -static-libgcc -static-libstdc++)
+
+    # IMPORTANT: do NOT enable LTO here. The shim's whole purpose is to own the
+    # return address the NR runtime validates; link-time optimisation across the
+    # call boundary is exactly what would defeat it.
+    target_compile_options(nvngx PRIVATE -O2)
+    target_link_options(nvngx PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 
 install(TARGETS DLSS_Nuke_Worker nvngx
-        RUNTIME DESTINATION .)
+        RUNTIME DESTINATION .
+        LIBRARY DESTINATION .)

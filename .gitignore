@@ -63,7 +63,8 @@ test_render_*.exr
 !install/**/*.png
 
 # Local test scripts (retained locally for CLI verification, untracked in Git)
-/tests/
+# /tests/ is tracked in this fork: bridge_test, worker_probe and fake_worker
+# are the documented Linux verification ladder (see BUILD-LINUX.md).
 
 # Internal Studio Scripts (Contains private UNC paths / hosts)
 tools/*publish*
@@ -97,3 +98,11 @@ release-notes.private.md
 
 # Local agent instructions are intentionally not part of the public repository.
 /AGENTS.md
+
+# ---- Linux port ----------------------------------------------------
+# Wine prefix now lives in ~/.local/share/dlss5-wine/prefix, never in the
+# repository or in ~/.nuke, but ignore a stray one just in case.
+wineprefix/
+*.tar.zst
+# Reproducer output
+upstream/ngx_repro.out

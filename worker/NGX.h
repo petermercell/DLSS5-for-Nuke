@@ -63,6 +63,26 @@ struct NVSDK_NGX_Handle { uint32_t Id; };
 
 // ---- Parameter interface (vtable must match nvngx.dll exactly) -----------
 // Derived from official DLSS SDK 3.x nvsdk_ngx.h (Apache 2.0 license)
+//
+// OVERLOAD ORDER IS COMPILER-DEPENDENT AND MUST NOT BE "TIDIED UP".
+//
+// MSVC gathers every overload of one name at the position of the FIRST
+// declaration and emits them into the vtable in REVERSE declaration order.
+// GCC/Clang (and therefore mingw-w64) emit them in declaration order. nvngx.dll
+// is built with MSVC, so a mingw-built caller that transcribes NVIDIA's header
+// literally gets a mirror-image vtable within each overload group:
+//
+//     Set(name, ID3D12Resource*)  ->  lands on  Set(name, float)
+//
+// which reads its argument from XMM2, never sees the pointer, and stores
+// nothing. NGX then fails EvaluateFeature with 0xBAD00005 and logs
+// "could not find Color parameter", while the integer setters keep working by
+// luck because int/unsigned int store the same 32 bits. Verified empirically
+// against _nvngx.dll from driver 610.57.04: with the reversed order below,
+// Set("Color", ID3D12Resource*) round-trips through Get and DLSS evaluates.
+//
+// Slot numbers in the comments are the observed vtable indices.
+#if defined(_MSC_VER)
 struct NVSDK_NGX_Parameter {
     virtual void Set(const char* n, unsigned long long v) = 0;
     virtual void Set(const char* n, float v)              = 0;
@@ -82,6 +102,27 @@ struct NVSDK_NGX_Parameter {
     virtual NVSDK_NGX_Result Get(const char* n, void** v)              const = 0;
     virtual void Reset() = 0;
 };
+#else
+struct NVSDK_NGX_Parameter {
+    virtual void Set(const char* n, void* v)              = 0;   // slot  0
+    virtual void Set(const char* n, ID3D12Resource* v)    = 0;   // slot  1
+    virtual void Set(const char* n, ID3D11Resource* v)    = 0;   // slot  2
+    virtual void Set(const char* n, int v)                = 0;   // slot  3
+    virtual void Set(const char* n, unsigned int v)       = 0;   // slot  4
+    virtual void Set(const char* n, double v)             = 0;   // slot  5
+    virtual void Set(const char* n, float v)              = 0;   // slot  6
+    virtual void Set(const char* n, unsigned long long v) = 0;   // slot  7
+    virtual NVSDK_NGX_Result Get(const char* n, void** v)              const = 0;  // 8
+    virtual NVSDK_NGX_Result Get(const char* n, ID3D12Resource** v)    const = 0;  // 9
+    virtual NVSDK_NGX_Result Get(const char* n, ID3D11Resource** v)    const = 0;  // 10
+    virtual NVSDK_NGX_Result Get(const char* n, int* v)                const = 0;  // 11
+    virtual NVSDK_NGX_Result Get(const char* n, unsigned int* v)       const = 0;  // 12
+    virtual NVSDK_NGX_Result Get(const char* n, double* v)             const = 0;  // 13
+    virtual NVSDK_NGX_Result Get(const char* n, float* v)              const = 0;  // 14
+    virtual NVSDK_NGX_Result Get(const char* n, unsigned long long* v) const = 0;  // 15
+    virtual void Reset() = 0;                                                      // 16
+};
+#endif
 
 // ---- Function pointer types for dynamic loading --------------------------
 typedef NVSDK_NGX_Result(__cdecl* PFN_NGX_D3D12_Init)(

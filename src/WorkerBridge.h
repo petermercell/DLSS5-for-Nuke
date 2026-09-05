@@ -1,5 +1,8 @@
 #pragma once
-#include <windows.h>
+#include "Platform.h"
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -97,11 +100,19 @@ public:
     bool isRunning();
 
 private:
+#ifdef _WIN32
     HANDLE hProcess = NULL;
     HANDLE hChildStd_IN_Rd = NULL;
     HANDLE hChildStd_IN_Wr = NULL;
     HANDLE hChildStd_OUT_Rd = NULL;
     HANDLE hChildStd_OUT_Wr = NULL;
+#else
+    // POSIX: the worker is an ordinary child process wired to two anonymous
+    // pipes. -1 means "closed". The child is reaped in stop().
+    pid_t m_pid        = -1;
+    int   m_fdChildIn  = -1;  // parent -> child  (child's stdin,  write end)
+    int   m_fdChildOut = -1;  // child  -> parent (child's stdout, read end)
+#endif
 
     SRWLOCK m_lock = SRWLOCK_INIT;
     bool is_running = false;

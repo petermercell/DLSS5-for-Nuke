@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Experimental-F59E0B.svg)](https://github.com/KJzzzKJ/DLSS5-for-Nuke/releases)
-[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(x64)-0078D6.svg)](https://www.microsoft.com/windows)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20(x64)-0078D6.svg)](BUILD-LINUX.md)
 [![Nuke Versions](https://img.shields.io/badge/Nuke-15.0%20%7C%2017.0-F9A01B.svg)](https://www.foundry.com/products/nuke)
 [![Hardware](https://img.shields.io/badge/GPU-NVIDIA%20RTX-76B900.svg)](https://www.nvidia.com)
 
@@ -15,6 +15,24 @@ a native Nuke node and an isolated background worker process.
 > This project uses observed, undocumented runtime behavior. It is not
 > affiliated with, endorsed by, or supported by NVIDIA or Foundry. Compatibility
 > can change with Nuke, GPU driver, and user-supplied runtime versions.
+
+## Linux
+
+This fork runs on Linux. The Nuke node is native (`.so`, POSIX process and IPC
+layer), and the worker — which cannot be made native, because NGX feature 18
+exists only as a Windows binary — runs under Wine with vkd3d-proton translating
+D3D12 to Vulkan. Both halves cross-compile on Linux with mingw-w64; no Windows
+machine is required to build or to run.
+
+Verified on Rocky Linux 9.8, NVIDIA RTX A5000, driver 610.57.04, Nuke 17.0v1 and
+17.1v1, with DLSS-NR (feature 18) and DLSS-SR (feature 1) both evaluating and
+producing real output.
+
+**[BUILD-LINUX.md](BUILD-LINUX.md)** is the complete guide: setup, the four-stage
+verification ladder, how to add a new Nuke version, and every failure signature
+found along the way. Read the vtable section before touching any NGX code — MSVC
+and GCC order overloaded virtual functions differently, and getting it wrong
+fails in a way that looks like a working DLSS install.
 
 ## What it does
 
@@ -38,9 +56,9 @@ multi-pass workflows.
 
 | Component | Requirement |
 | --- | --- |
-| Operating system | Windows 10 or Windows 11, 64-bit |
+| Operating system | Windows 10 / 11 64-bit, or Linux 64-bit (see [BUILD-LINUX.md](BUILD-LINUX.md)) |
 | GPU | NVIDIA RTX GPU |
-| Nuke | Nuke 15.0 or Nuke 17.0 build matching the supplied plug-in DLL |
+| Nuke | A build matching the supplied plug-in: Nuke 15.0 / 17.0 on Windows, 17.0 / 17.1 verified on Linux |
 | Runtime | A compatible runtime obtained and configured legally by the user |
 
 Nuke point releases require their own compatible plug-in build. Do not assume a

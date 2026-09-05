@@ -1,3 +1,8 @@
+// Windows implementation. The POSIX implementation lives in
+// WorkerBridge_posix.cpp; both are listed in CMakeLists.txt and the guards
+// below keep exactly one of them live per platform.
+#ifdef _WIN32
+
 #include "WorkerBridge.h"
 #include <iostream>
 
@@ -296,3 +301,5 @@ bool WorkerBridge::writeExact(const void* buffer, size_t size) {
     }
     return true;
 }
+
+#endif // _WIN32

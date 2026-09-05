@@ -56,7 +56,23 @@ int main() {
     bool ok = worker.init(hdr);
 
     // ---- 3. Send SetupResponse ----
-    SetupResponse setup = ok ? worker.getSetup() : makeFailSetup();
+    // On failure, carry the NGX result code across the wire and put the stage
+    // name on stderr. stdout is binary protocol, so stderr is the only channel;
+    // the Linux launcher points it at dlss5-worker.log, and the Nuke plug-in
+    // sends it to the null device.
+    SetupResponse setup = ok ? worker.getSetup()
+                             : makeFailSetup(worker.getSetup().setup_result);
+    if (!ok) {
+        std::fprintf(stderr, "[DLSS5 worker] init failed: %s\n", worker.getLastError().c_str());
+        std::fprintf(stderr, "[DLSS5 worker] setup_result=0x%08X\n", setup.setup_result);
+        std::fflush(stderr);
+    } else {
+        std::fprintf(stderr, "[DLSS5 worker] init ok: render %ux%u -> out %ux%u, preset %u\n",
+                     setup.render_width, setup.render_height,
+                     setup.output_width, setup.output_height,
+                     setup.applied_model_preset);
+        std::fflush(stderr);
+    }
     if (!writeAll(hOut, &setup, sizeof(setup))) return 1;
     if (!ok) return 1;
 

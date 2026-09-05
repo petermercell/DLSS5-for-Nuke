@@ -1,6 +1,6 @@
 #pragma once
 
-#include <windows.h>
+#include "Platform.h"
 #include "DDImage/Iop.h"
 #include "DDImage/Row.h"
 #include "DDImage/Knobs.h"
